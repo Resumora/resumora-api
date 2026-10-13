@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import shutil
@@ -10,6 +9,7 @@ from pdf2docx import Converter
 
 app = FastAPI(title="Resumora Engine")
 
+# CORS config
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,6 +25,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 def home():
     return {"status": "online", "message": "Resumora Engine Active"}
 
+# 1. WORD TO PDF (LibreOffice)
 @app.post("/convert/word-to-pdf")
 async def word_to_pdf(file: UploadFile = File(...)):
     if not (file.filename.endswith(".docx") or file.filename.endswith(".doc")):
@@ -61,6 +62,7 @@ async def word_to_pdf(file: UploadFile = File(...)):
         if os.path.exists(input_file):
             os.remove(input_file)
 
+# 2. PDF TO WORD (Fault-Tolerant Hybrid Engine)
 @app.post("/convert/pdf-to-word")
 async def pdf_to_word(file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
@@ -73,19 +75,50 @@ async def pdf_to_word(file: UploadFile = File(...)):
     with open(input_file, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    conversion_successful = False
+
+    # Attempt 1: LibreOffice Writer direct DOCX conversion (Valid XML guaranteed)
     try:
-        cv = Converter(input_file)
-        cv.convert(output_docx, start=0, end=None)
-        cv.close()
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--infilter=writer_pdf_import",
+            "--convert-to", "docx:MS Word 2007 XML",
+            input_file,
+            "--outdir", TEMP_DIR
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+        base_name = os.path.splitext(input_file)[0]
+        lo_output = f"{base_name}.docx"
 
-        if not os.path.exists(output_docx):
-            raise HTTPException(status_code=500, detail="Conversion failed")
+        if os.path.exists(lo_output) and os.path.getsize(lo_output) > 1000:
+            output_docx = lo_output
+            conversion_successful = True
+    except Exception as e:
+        print(f"LibreOffice conversion failed: {e}")
 
-        return FileResponse(
-            output_docx,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename=f"{os.path.splitext(file.filename)[0]}.docx"
-        )
-    finally:
+    # Attempt 2: pdf2docx fallback with safe parse settings
+    if not conversion_successful:
+        try:
+            cv = Converter(input_file)
+            # connected_borders=False table XML corruptions prevent karta hai
+            cv.convert(output_docx, start=0, end=None, connected_borders=False)
+            cv.close()
+            if os.path.exists(output_docx) and os.path.getsize(output_docx) > 500:
+                conversion_successful = True
+        except Exception as e:
+            print(f"pdf2docx fallback error: {e}")
+
+    if not conversion_successful or not os.path.exists(output_docx):
         if os.path.exists(input_file):
             os.remove(input_file)
+        raise HTTPException(status_code=500, detail="Conversion failed. Document contains unparseable vectors.")
+
+    if os.path.exists(input_file):
+        os.remove(input_file)
+
+    return FileResponse(
+        output_docx,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=f"{os.path.splitext(file.filename)[0]}.docx"
+    )
