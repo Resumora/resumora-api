@@ -1,17 +1,18 @@
 import os
-import subprocess
+import re
 import shutil
 import uuid
 import asyncio
+import subprocess
 import docx
+from docx.oxml import parse_xml
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pdf2docx import Converter
 
-app = FastAPI(title="Resumora Engine - Production")
+app = FastAPI(title="Resumora Engine - Bulletproof Production")
 
-# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,136 +24,167 @@ app.add_middleware(
 TEMP_DIR = "/tmp/conversions"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# ----------------- CRASH PROTECTION CONFIG -----------------
-# 1. File Size Protection: Max 15 MB allowed (OOM crash se bachane ke liye)
-MAX_FILE_SIZE = 15 * 1024 * 1024  
-
-# 2. Concurrency Lock: Ek time par maximum 2 heavy tasks chalenge, baaki queue me wait karenge
-# (Isse ek sath 20 users aane par bhi server ka CPU 100% freeze nahi hoga)
-CONVERSION_SEMAPHORE = asyncio.Semaphore(2)
-
-# 3. Timeout: Agar koi conversion 45 second se zyada le toh terminate kar do
-PROCESS_TIMEOUT = 45
+# ----------------- PRODUCTION CONSTRAINTS -----------------
+MAX_FILE_SIZE = 15 * 1024 * 1024  # Strict 15 MB
+CONVERSION_SEMAPHORE = asyncio.Semaphore(2)  # Max 2 heavy conversions concurrently
+PROCESS_TIMEOUT = 45  # 45 Seconds strict timeout
+CHUNK_SIZE = 1024 * 1024  # 1 MB stream chunks
 # -----------------------------------------------------------
 
 
-def cleanup_files(*file_paths):
-    """Temporary files ko background me safely delete karne ke liye"""
-    for path in file_paths:
-        if path and os.path.exists(path):
+def sanitize_filename(filename: str) -> str:
+    """Special characters aur spaces ko clean karke safe banata hai"""
+    name, ext = os.path.splitext(filename)
+    clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', name)
+    return f"{clean_name[:40]}{ext}"
+
+
+def cleanup_paths(*paths):
+    """File aur temporary user-profile folders ko safely clean karta hai"""
+    for p in paths:
+        if p and os.path.exists(p):
             try:
-                os.remove(path)
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
             except Exception:
                 pass
 
 
-def clean_and_brand_docx(docx_path: str):
-    """Python-docx metadata ko override karke Resumora branding set karta hai"""
+def patch_docx_for_windows_explorer(docx_path: str):
+    """
+    1. Python-docx metadata ko Resumora se replace karta hai.
+    2. 'app.xml' me Application='Microsoft Office Word' inject karta hai,
+       jisse Windows File Explorer bina MS Word khole full native Word icon render kare.
+    """
     try:
         doc = docx.Document(docx_path)
+        
+        # Core metadata clean
         core_props = doc.core_properties
         core_props.author = "Resumora Universe"
         core_props.last_modified_by = "Resumora Universe"
-        core_props.comments = "Processed privately via Resumora Engine"
+        core_props.comments = "Generated privately via Resumora Universe Engine"
+        core_props.category = "Resume Document"
+
+        # Native Microsoft Office Word application signature injection
+        try:
+            app_part = doc.part.package.app_properties
+            app_part.application = "Microsoft Office Word"
+            app_part.app_version = "16.0000"
+        except Exception:
+            pass
+
         doc.save(docx_path)
     except Exception as err:
-        print(f"Metadata sanitize error: {err}")
+        print(f"DOCX Patching error: {err}")
+
+
+async def save_file_safely(file: UploadFile, destination_path: str):
+    """Memory-safe chunk streaming: RAM full hone se bachata hai"""
+    total_size = 0
+    with open(destination_path, "wb") as buffer:
+        while chunk := await file.read(CHUNK_SIZE):
+            total_size += len(chunk)
+            if total_size > MAX_FILE_SIZE:
+                buffer.close()
+                if os.path.exists(destination_path):
+                    os.remove(destination_path)
+                raise HTTPException(status_code=413, detail="File too large! Max limit is 15 MB.")
+            buffer.write(chunk)
 
 
 @app.get("/")
-def home():
-    return {"status": "online", "message": "Resumora Engine Production Active"}
+def health_check():
+    return {"status": "online", "engine": "Resumora Universe", "protected": True}
 
 
-# ==========================================
-# 1. WORD TO PDF (Crash Safe)
-# ==========================================
+# ========================================================
+# 1. WORD TO PDF (Isolated LibreOffice Profiles)
+# ========================================================
 @app.post("/convert/word-to-pdf")
 async def word_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    # Extension check
-    if not (file.filename.endswith(".docx") or file.filename.endswith(".doc")):
-        raise HTTPException(status_code=400, detail="Only DOC or DOCX files allowed.")
-
-    # Size check before saving to disk
-    contents = await file.read()
-    if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large! Maximum limit is 15 MB.")
-    file.file.seek(0)
+    orig_name = file.filename or "document.docx"
+    if not (orig_name.lower().endswith(".docx") or orig_name.lower().endswith(".doc")):
+        raise HTTPException(status_code=400, detail="Only .doc or .docx files are accepted.")
 
     session_id = str(uuid.uuid4())
-    input_file = os.path.join(TEMP_DIR, f"{session_id}_{file.filename}")
-    base_name = os.path.splitext(input_file)[0]
-    output_pdf = f"{base_name}.pdf"
+    safe_name = sanitize_filename(orig_name)
+    input_file = os.path.join(TEMP_DIR, f"{session_id}_{safe_name}")
+    libreoffice_profile = os.path.join(TEMP_DIR, f"lo_profile_{session_id}")
+    
+    await save_file_safely(file, input_file)
 
-    # Save uploaded file
-    with open(input_file, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Concurrency Queue ke andar execute karein
     async with CONVERSION_SEMAPHORE:
         try:
+            # -env flag ensure karta hai ki multiple concurrent requests me LibreOffice lock crash na ho
             cmd = [
                 "libreoffice",
+                f"-env:UserInstallation=file://{libreoffice_profile}",
                 "--headless",
                 "--convert-to", "pdf",
                 input_file,
                 "--outdir", TEMP_DIR
             ]
-            # Timeout ke sath run karein taaki LibreOffice hang na ho
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PROCESS_TIMEOUT)
+            
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=PROCESS_TIMEOUT
+            )
+
+            base_name = os.path.splitext(input_file)[0]
+            output_pdf = f"{base_name}.pdf"
 
             if not os.path.exists(output_pdf) or os.path.getsize(output_pdf) < 500:
                 raise HTTPException(status_code=500, detail="Conversion generated empty file.")
 
-            # Background me clean karein download deliver hone ke baad
-            background_tasks.add_task(cleanup_files, input_file, output_pdf)
+            client_download_name = f"{os.path.splitext(safe_name)[0]}.pdf"
+            background_tasks.add_task(cleanup_paths, input_file, output_pdf, libreoffice_profile)
 
             return FileResponse(
                 output_pdf,
                 media_type="application/pdf",
-                filename=f"{os.path.splitext(file.filename)[0]}.pdf"
+                filename=client_download_name,
+                headers={"Content-Disposition": f'attachment; filename="{client_download_name}"'}
             )
 
         except subprocess.TimeoutExpired:
-            cleanup_files(input_file, output_pdf)
-            raise HTTPException(status_code=504, detail="Conversion timed out. File might be too complex.")
+            cleanup_paths(input_file, libreoffice_profile)
+            raise HTTPException(status_code=504, detail="File too complex: conversion timed out.")
         except Exception as e:
-            cleanup_files(input_file, output_pdf)
-            raise HTTPException(status_code=500, detail=f"Word to PDF conversion failed: {str(e)}")
+            cleanup_paths(input_file, libreoffice_profile)
+            raise HTTPException(status_code=500, detail=f"Word to PDF conversion error: {str(e)}")
 
 
-# ==========================================
-# 2. PDF TO WORD (Layout Preserved & Crash Safe)
-# ==========================================
+# ========================================================
+# 2. PDF TO WORD (High-Precision Formatting + Native Shell Icon)
+# ========================================================
 @app.post("/convert/pdf-to-word")
 async def pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    # Extension check
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files allowed.")
-
-    # Size check before saving to disk
-    contents = await file.read()
-    if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large! Maximum limit is 15 MB.")
-    file.file.seek(0)
+    orig_name = file.filename or "document.pdf"
+    if not orig_name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only .pdf files are accepted.")
 
     session_id = str(uuid.uuid4())
-    input_file = os.path.join(TEMP_DIR, f"{session_id}_{file.filename}")
+    safe_name = sanitize_filename(orig_name)
+    input_file = os.path.join(TEMP_DIR, f"{session_id}_{safe_name}")
     output_docx = os.path.join(TEMP_DIR, f"{session_id}_converted.docx")
+    libreoffice_profile = os.path.join(TEMP_DIR, f"lo_profile_{session_id}")
 
-    # Save uploaded file
-    with open(input_file, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    await save_file_safely(file, input_file)
 
-    # Concurrency Queue ke andar execute karein
     async with CONVERSION_SEMAPHORE:
         conversion_success = False
 
-        # Primary Engine: pdf2docx
+        # Primary Engine: pdf2docx with precise layout flow
         try:
             loop = asyncio.get_event_loop()
-            
-            def run_pdf2docx():
+
+            def execute_conversion():
                 cv = Converter(input_file)
                 cv.convert(
                     output_docx,
@@ -163,26 +195,31 @@ async def pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File
                 )
                 cv.close()
 
-            # Async loop me run taaki server event loop block na ho
-            await asyncio.wait_for(loop.run_in_executor(None, run_pdf2docx), timeout=PROCESS_TIMEOUT)
+            await asyncio.wait_for(loop.run_in_executor(None, execute_conversion), timeout=PROCESS_TIMEOUT)
 
             if os.path.exists(output_docx) and os.path.getsize(output_docx) > 500:
                 conversion_success = True
 
-        except Exception as e:
-            print(f"pdf2docx conversion error: {e}")
+        except Exception as primary_err:
+            print(f"pdf2docx engine error: {primary_err}")
 
-        # Secondary Fallback: LibreOffice (agar pdf2docx fail ho jaye)
+        # Secondary Engine Fallback: LibreOffice with isolated profile
         if not conversion_success:
             try:
                 cmd = [
                     "libreoffice",
+                    f"-env:UserInstallation=file://{libreoffice_profile}",
                     "--headless",
                     "--convert-to", "docx",
                     input_file,
                     "--outdir", TEMP_DIR
                 ]
-                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PROCESS_TIMEOUT)
+                subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=PROCESS_TIMEOUT
+                )
                 base_name = os.path.splitext(input_file)[0]
                 lo_output = f"{base_name}.docx"
 
@@ -192,18 +229,19 @@ async def pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File
             except Exception as lo_err:
                 print(f"LibreOffice fallback error: {lo_err}")
 
-        # Final Verification & Response
         if conversion_success and os.path.exists(output_docx):
-            # 'python-docx' branding remove karke Resumora Universe set karein
-            clean_and_brand_docx(output_docx)
+            # Patch Word document metadata and application signature for full native icon
+            patch_docx_for_windows_explorer(output_docx)
 
-            background_tasks.add_task(cleanup_files, input_file, output_docx)
+            client_download_name = f"{os.path.splitext(safe_name)[0]}.docx"
+            background_tasks.add_task(cleanup_paths, input_file, output_docx, libreoffice_profile)
 
             return FileResponse(
                 output_docx,
                 media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                filename=f"{os.path.splitext(file.filename)[0]}.docx"
+                filename=client_download_name,
+                headers={"Content-Disposition": f'attachment; filename="{client_download_name}"'}
             )
         else:
-            cleanup_files(input_file, output_docx)
-            raise HTTPException(status_code=500, detail="Could not convert document. Please check PDF format.")
+            cleanup_paths(input_file, output_docx, libreoffice_profile)
+            raise HTTPException(status_code=500, detail="Conversion failed. The PDF might be corrupted or image-only.")
